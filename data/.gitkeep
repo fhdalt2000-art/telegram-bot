@@ -1,0 +1,472 @@
+from typing import Any, Dict
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from bot.config import ADMIN_ID, BOT_TOKEN, DB_PATH
+from bot.database import Database
+
+
+db = Database(DB_PATH)
+
+CHECKOUT_PHONE, CHECKOUT_ADDRESS = range(2)
+ADMIN_ADD_NAME, ADMIN_ADD_DESC, ADMIN_ADD_PRICE, ADMIN_ADD_CATEGORY, ADMIN_ADD_STOCK = range(5)
+
+
+def build_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🛍️ المنتجات", callback_data="products"),
+                InlineKeyboardButton("🛒 السلة", callback_data="cart"),
+            ],
+            [
+                InlineKeyboardButton("✅ إنهاء الطلب", callback_data="checkout"),
+                InlineKeyboardButton("❓ المساعدة", callback_data="help"),
+            ],
+        ]
+    )
+
+
+def build_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ إضافة منتج", callback_data="add_product")],
+            [InlineKeyboardButton("📦 الطلبات", callback_data="view_orders")],
+            [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
+        ]
+    )
+
+
+def format_product(product: Dict[str, Any]) -> str:
+    return (
+        f"📦 {product['name']}\n"
+        f"📝 {product['description']}\n"
+        f"💰 السعر: {product['price']} ر.س\n"
+        f"📊 المخزون: {product['stock']}\n"
+        f"🏷️ التصنيف: {product['category']}"
+    )
+
+
+def build_products_keyboard(products: list) -> InlineKeyboardMarkup:
+    keyboard = []
+    row = []
+    for product in products:
+        row.append(
+            InlineKeyboardButton(
+                f"{product['name']} ({product['price']} ر.س)",
+                callback_data=f"product:{product['id']}",
+            )
+        )
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    cart_items = db.get_cart(user_id)
+    keyboard: list[list[InlineKeyboardButton]] = []
+
+    for item in cart_items:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{item['name']} × {item['quantity']}",
+                    callback_data=f"product:{item['product_id']}",
+                ),
+                InlineKeyboardButton("＋", callback_data=f"inc:{item['product_id']}"),
+                InlineKeyboardButton("－", callback_data=f"dec:{item['product_id']}"),
+                InlineKeyboardButton("🗑️", callback_data=f"remove:{item['product_id']}"),
+            ]
+        )
+
+    if cart_items:
+        keyboard.append([InlineKeyboardButton("✅ إنهاء الطلب", callback_data="checkout")])
+    keyboard.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    products = db.get_products()
+    if not products:
+        message = "لا توجد منتجات حالياً."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(message)
+        else:
+            await update.message.reply_text(message)
+        return
+
+    product_list = "📦 قائمة المنتجات:\n\n"
+    for product in products:
+        product_list += f"• {product['name']} — {product['price']} ر.س\n"
+
+    keyboard = build_products_keyboard(products)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(product_list, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(product_list, reply_markup=keyboard)
+
+
+async def send_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        db.get_or_create_user(update.effective_user.id, update.effective_user.full_name)
+        user = db.get_user(update.effective_user.id)
+
+    cart_items = db.get_cart(user["id"])
+    if not cart_items:
+        msg = "🛒 السلة فارغة حاليًا."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=build_main_menu())
+        else:
+            await update.message.reply_text(msg, reply_markup=build_main_menu())
+        return
+
+    total = 0.0
+    lines = ["🛒 السلة الحالية:\n"]
+    for item in cart_items:
+        item_total = float(item["price"]) * int(item["quantity"])
+        total += item_total
+        lines.append(f"• {item['name']} × {item['quantity']} = {item_total} ر.س")
+
+    lines.append(f"\n💵 الإجمالي: {total} ر.س")
+    if update.callback_query:
+        await update.callback_query.edit_message_text("\n".join(lines), reply_markup=build_cart_keyboard(user["id"]))
+    else:
+        await update.message.reply_text("\n".join(lines), reply_markup=build_cart_keyboard(user["id"]))
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "main_menu":
+        await query.edit_message_text("🏠 القائمة الرئيسية", reply_markup=build_main_menu())
+        return
+
+    if data == "products":
+        await send_products(update, context)
+        return
+
+    if data == "cart":
+        await send_cart(update, context)
+        return
+
+    if data == "help":
+        help_text = (
+            "📘 التعليمات:\n\n"
+            "/start — بدء البوت\n"
+            "/products — عرض المنتجات\n"
+            "/cart — عرض السلة\n"
+            "/checkout — إنهاء الطلب\n"
+            "/admin — لوحة الإدارة\n"
+        )
+        await query.edit_message_text(help_text, reply_markup=build_main_menu())
+        return
+
+    if data == "checkout":
+        user = db.get_user(query.from_user.id)
+        if not user:
+            user_id = db.get_or_create_user(query.from_user.id, query.from_user.full_name)
+        else:
+            user_id = user["id"]
+
+        cart_items = db.get_cart(user_id)
+        if not cart_items:
+            await query.edit_message_text("🛒 السلة فارغة. لا يوجد طلب لإكماله.", reply_markup=build_main_menu())
+            return
+
+        await query.edit_message_text("📱 اكتب رقم الهاتف للتواصل:")
+        context.user_data["checkout_stage"] = "phone"
+        return
+
+    if data == "admin":
+        if query.from_user.id != int(ADMIN_ID):
+            await query.edit_message_text("🚫 لا يوجد صلاحية للمشرف.", reply_markup=build_main_menu())
+            return
+        await query.edit_message_text("🛠️ لوحة الإدارة", reply_markup=build_admin_menu())
+        return
+
+    if data == "add_product":
+        if query.from_user.id != int(ADMIN_ID):
+            await query.edit_message_text("🚫 لا يوجد صلاحية للمشرف.", reply_markup=build_main_menu())
+            return
+        await query.edit_message_text("✏️ اكتب اسم المنتج:")
+        context.user_data["admin_stage"] = "name"
+        return
+
+    if data == "view_orders":
+        if query.from_user.id != int(ADMIN_ID):
+            await query.edit_message_text("🚫 لا يوجد صلاحية للمشرف.", reply_markup=build_main_menu())
+            return
+        orders = db.get_orders(10)
+        if not orders:
+            await query.edit_message_text("لا توجد طلبات حتى الآن.", reply_markup=build_admin_menu())
+            return
+
+        order_text = "📦 آخر الطلبات:\n\n"
+        for order in orders:
+            order_text += (
+                f"# {order['id']} | المستخدم: {order['name']} | "
+                f"الإجمالي: {order['total']} ر.س | الحالة: {order['status']}\n"
+            )
+        await query.edit_message_text(order_text, reply_markup=build_admin_menu())
+        return
+
+    if data.startswith("product:"):
+        product_id = int(data.split(":", 1)[1])
+        product = db.get_product(product_id)
+        if not product:
+            await query.edit_message_text("المنتج غير موجود.", reply_markup=build_main_menu())
+            return
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🛒 أضف إلى السلة", callback_data=f"add_cart:{product['id']}")],
+                [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
+            ]
+        )
+        await query.edit_message_text(format_product(product), reply_markup=keyboard)
+        return
+
+    if data.startswith("add_cart:"):
+        product_id = int(data.split(":", 1)[1])
+        product = db.get_product(product_id)
+        if not product:
+            await query.edit_message_text("المنتج غير موجود.", reply_markup=build_main_menu())
+            return
+
+        user_id = db.get_or_create_user(query.from_user.id, query.from_user.full_name)
+        db.add_to_cart(user_id, product_id, 1)
+        await query.edit_message_text(f"✅ تم إضافة {product['name']} إلى السلة.", reply_markup=build_main_menu())
+        return
+
+    if data.startswith("inc:"):
+        product_id = int(data.split(":", 1)[1])
+        user_id = db.get_or_create_user(query.from_user.id, query.from_user.full_name)
+        db.change_cart_quantity(user_id, product_id, 1)
+        await send_cart(update, context)
+        return
+
+    if data.startswith("dec:"):
+        product_id = int(data.split(":", 1)[1])
+        user_id = db.get_or_create_user(query.from_user.id, query.from_user.full_name)
+        db.change_cart_quantity(user_id, product_id, -1)
+        await send_cart(update, context)
+        return
+
+    if data.startswith("remove:"):
+        product_id = int(data.split(":", 1)[1])
+        user_id = db.get_or_create_user(query.from_user.id, query.from_user.full_name)
+        db.remove_from_cart(user_id, product_id)
+        await send_cart(update, context)
+        return
+
+    if data == "main_menu":
+        await query.edit_message_text("🏠 القائمة الرئيسية", reply_markup=build_main_menu())
+        return
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        db.get_or_create_user(update.effective_user.id, update.effective_user.full_name)
+
+    text = (
+        "مرحباً بك في متجر تيليجرام!\n\n"
+        "اختر من القائمة ما يناسبك:\n"
+        "- استعراض المنتجات\n"
+        "- السلة\n"
+        "- إنهاء الطلب\n"
+    )
+    await update.message.reply_text(text, reply_markup=build_main_menu())
+
+
+async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_products(update, context)
+
+
+async def cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_cart(update, context)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "📘 التعليمات:\n\n"
+        "/start — بدء البوت\n"
+        "/products — عرض المنتجات\n"
+        "/cart — عرض السلة\n"
+        "/checkout — إنهاء الطلب\n"
+        "/admin — لوحة الإدارة\n"
+    )
+    await update.message.reply_text(help_text, reply_markup=build_main_menu())
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != int(ADMIN_ID):
+        await update.message.reply_text("🚫 لا يوجد صلاحية للمشرف.")
+        return
+    await update.message.reply_text("🛠️ لوحة الإدارة", reply_markup=build_admin_menu())
+
+
+async def checkout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        user_id = db.get_or_create_user(update.effective_user.id, update.effective_user.full_name)
+    else:
+        user_id = user["id"]
+
+    cart_items = db.get_cart(user_id)
+    if not cart_items:
+        await update.message.reply_text("🛒 السلة فارغة. لا يوجد طلب لإكماله.", reply_markup=build_main_menu())
+        return
+
+    await update.message.reply_text("📱 اكتب رقم الهاتف للتواصل:")
+    context.user_data["checkout_stage"] = "phone"
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
+        db.get_or_create_user(user_id, update.effective_user.full_name)
+        user = db.get_user(user_id)
+
+    stage = context.user_data.get("checkout_stage")
+    admin_stage = context.user_data.get("admin_stage")
+
+    if stage == "phone":
+        context.user_data["checkout_phone"] = text
+        context.user_data["checkout_stage"] = "address"
+        await update.message.reply_text("📍 اكتب عنوان التوصيل:")
+        return
+
+    if stage == "address":
+        phone = context.user_data.get("checkout_phone")
+        if not phone:
+            await update.message.reply_text("حدث خطأ. ابدأ من /checkout مرة أخرى.")
+            context.user_data.pop("checkout_stage", None)
+            return
+
+        db.save_user_contact(user_id, phone, text)
+        order_result = db.create_order(user["id"])
+        if not order_result:
+            await update.message.reply_text("🛒 السلة فارغة، لا يمكن إنشاء طلب جديد.", reply_markup=build_main_menu())
+            context.user_data.pop("checkout_stage", None)
+            return
+
+        order_id = order_result["order_id"]
+        total = order_result["total"]
+        context.user_data.pop("checkout_stage", None)
+        await update.message.reply_text(
+            f"✅ تم إنشاء الطلب بنجاح\n\n"
+            f"رقم الطلب: #{order_id}\n"
+            f"الإجمالي: {total} ر.س\n"
+            f"الهاتف: {phone}\n"
+            f"العنوان: {text}\n\n"
+            "سيتواصل معك المشرف قريبًا.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    if admin_stage == "name":
+        context.user_data["new_product_name"] = text
+        context.user_data["admin_stage"] = "description"
+        await update.message.reply_text("📝 اكتب وصف المنتج:")
+        return
+
+    if admin_stage == "description":
+        context.user_data["new_product_desc"] = text
+        context.user_data["admin_stage"] = "price"
+        await update.message.reply_text("💰 اكتب سعر المنتج:")
+        return
+
+    if admin_stage == "price":
+        try:
+            price = float(text)
+        except ValueError:
+            await update.message.reply_text("السعر غير صحيح. أعد كتابة السعر بشكل صحيح.")
+            return
+        context.user_data["new_product_price"] = price
+        context.user_data["admin_stage"] = "category"
+        await update.message.reply_text("🏷️ اكتب فئة المنتج (مثل: مشروبات، حلويات، وجبات):")
+        return
+
+    if admin_stage == "category":
+        context.user_data["new_product_category"] = text
+        context.user_data["admin_stage"] = "stock"
+        await update.message.reply_text("📊 اكتب الكمية المتاحة في المخزون:")
+        return
+
+    if admin_stage == "stock":
+        try:
+            stock = int(text)
+        except ValueError:
+            await update.message.reply_text("الكمية غير صحيحة. أعد الكتابة بشكل صحيح.")
+            return
+
+        product_name = context.user_data.get("new_product_name")
+        product_desc = context.user_data.get("new_product_desc")
+        product_price = context.user_data.get("new_product_price")
+        product_category = context.user_data.get("new_product_category")
+
+        if not all([product_name, product_desc, product_price, product_category]):
+            await update.message.reply_text("حدث خطأ أثناء إدخال البيانات. ابدأ من جديد باستخدام /admin")
+            context.user_data.pop("admin_stage", None)
+            return
+
+        db.add_product(product_name, product_desc, product_price, product_category, stock)
+        context.user_data.pop("admin_stage", None)
+        await update.message.reply_text(
+            "✅ تم إضافة المنتج بنجاح.",
+            reply_markup=build_admin_menu(),
+        )
+        return
+
+    if text.lower() == "menu":
+        await update.message.reply_text("🏠 القائمة الرئيسية", reply_markup=build_main_menu())
+        return
+
+    if text.lower() == "hello":
+        await update.message.reply_text("مرحبا! استخدم /start لعرض القائمة.")
+        return
+
+    await update.message.reply_text("أمر غير معروف. استخدم /help أو /start.")
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN غير موجود. أضف قيمة في ملف .env")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("products", products_command))
+    application.add_handler(CommandHandler("cart", cart_command))
+    application.add_handler(CommandHandler("checkout", checkout_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    application.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
